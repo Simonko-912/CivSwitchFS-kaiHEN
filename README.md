@@ -1,5 +1,11 @@
 # CivSwitchFS-kaiHEN
 
+> [!NOTE]
+> Fork of [s8n/CivSwitchFS-kaiHEN](https://github.com/s8n/CivSwitchFS-kaiHEN) (branch `slop`, itself a fork of [ItsNerisma/CivSwitchFS](https://github.com/ItsNerisma/CivSwitchFS)) adapted for LDN delivery. Changes vs upstream (delivery only, payload code in `src/` untouched):
+> - `npm run build` writes the single-file payload to `payload.js` at the repository root (instead of `dist/core.js`); a prebuilt copy is committed. Default entry is `src/chain.mjs` so one payload carries promotion + kaiHEN chain.
+> - README documents the LDN flow: put `payload.js` in `switch/payload.js` on the SD card of a Switch 1 running [civswitch-ldn-nx](https://github.com/Simonko-912/civswitch-ldn-nx), join the lobby, press ZL — the payload goes over local wireless, no PC or Wi-Fi needed.
+> - `npm run send` / `npm run persist:*` kept as direct-IP fallback.
+
 > [!IMPORTANT]
 > Thanks to **Slapah** for the ns2jb filesystem port to CivSwitch and **Kurumuz** for the improved fork of ns2jb from **Pepsipu**, which laid the groundwork for this research. All kudos goes to them for the Civ FS port :heart: This is a fork of CivSwitchFS which is by Nerisma, who did the difficult work of getting FS acquisition work locally!
 
