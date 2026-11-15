@@ -28,9 +28,11 @@ Beware that fs vuln can be risky to utilize and may corrupt things like your sav
 
 ## Requirements
 
-- Node.js **20 or later** and npm
-- A Switch 2 with the CivSwitch Remote JS Loader already running and reachable
-  on the local network when installing persistence or sending a payload
+- Node.js **20 or later** and npm (only needed to rebuild the payload)
+- A Switch 2 with the CivSwitch Remote JS Loader already running
+- [CivSwitch-LDN-NX](https://github.com/Simonko-912/civswitch-ldn-nx) on a
+  Switch 1: it delivers `payload.js` over local wireless (LDN), so neither a
+  computer nor a Wi-Fi network is needed
 
 ## Usage
 
@@ -38,6 +40,30 @@ Install dependencies once from this repository:
 
 ~~~sh
 npm install
+~~~
+
+### Deliver the chain payload over LDN (recommended)
+
+`npm run build` writes the single-file chain payload (promotion + kaiHEN in
+one eval) to `payload.js` in the repository root. A prebuilt copy is
+committed, so you can skip the build.
+
+1. Copy `payload.js` to `switch/payload.js` on the SD card of the Switch 1
+   running CivSwitch-LDN-NX.
+2. On the Switch 2 SD card, place the kaiHEN files per the table below
+   (`/kaihen/bin/...`, `/hbmenu.nro`, `/switch/ounceshell.nro`).
+3. Start the CivSwitch Remote JS Loader on the Switch 2, launch
+   CivSwitch-LDN-NX on the Switch 1, join the lobby (R), then press **ZL**
+   to deliver `payload.js` over local wireless.
+
+Wait for `CHAIN: promotion retained a session — starting kaiHEN` and then
+`HEN IS RUNNING`. Close the game normally and hold R while opening a Switch 2
+ game twice to reach hbmenu.
+
+A computer on the same network can still push payloads directly:
+
+~~~sh
+npm run send -- <console-ip>
 ~~~
 
 ### Persist the whole kaiHEN chain (recommended)
@@ -85,15 +111,16 @@ limit, so chain builds are always minified.
 
 ### Launch CivSwitchFS by itself (not for end users)
 
-If you are not going for persistence, just start the CivSwitch Remote JS Loader
-using your usual CivSwitch setup. Then send the payload 
+For a promotion-only payload, build with the plain core entry:
 
 ~~~sh
-npm run send -- <console-ip>
+node tools/build.mjs src/core.js
 ~~~
 
-Wait for **`You just Civ Sevened your machine, congrats`** which obviously means success :tada: !
-Then, the loader automatically shows `Awaiting payload at <ip>:9026` and you are free to send payloads.
+Then deliver it with the LDN steps above (it replaces `payload.js` on the SD
+ card). Wait for **`You just Civ Sevened your machine, congrats`** which
+ obviously means success :tada: ! Then the loader shows
+`Awaiting payload at <ip>:9026` and is ready for more payloads.
 
 ### Booting faster next time (this will be automatised eventually)
 
