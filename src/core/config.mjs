@@ -1,4 +1,4 @@
-// Enable low-level logs and per-wave timing spans when diagnosing failed windows.
+// Start with verbose summaries disabled; controller Y toggles the mode.
 export const VERBOSE_LOGGING = false;
 
 export function createFspIdentityConfig() {
@@ -7,7 +7,7 @@ export function createFspIdentityConfig() {
   var SLOT_SIZE = 0x800;
   var WAVE_READ_SIZE = 0x10000;    // 64 KiB IStorage::Read per wave
   var DIRTY_FILE_SIZE = 0x800000;  // 8 MiB dirty write
-  var MAX_CONTROL_WAVES = 20;      // user-capped per launch
+  var MAX_CONTROL_WAVES = 13;      // user-capped per launch
   var MAX_COPY_ATTEMPTS = 30;      // per nulWrites step per batch
   var COPY_BATCHES = 3;
   var MAX_ADDRESS_CANDIDATES = 5;
@@ -26,6 +26,8 @@ export function createFspIdentityConfig() {
   var WINDOW_MINIMUM_CACHE_HELD = 0x2600; // reference receive-window floor
   // Extra reference guard applied uniformly to every field copy.
   var FIELD_MINIMUM_CACHE_HELD = 0x2810;
+  // Normal alias waves rewrite save:/hole/commit_data (8 MiB) and overlap Commit.
+  var MONITORING_ROUNDS = 4;        // extra snapshot re-reads after release
   var CACHE_READ_SIZE = 0x200000;  // 2 MiB widened read
   var CONTROL_SIZE = 0x4000;       // 16 KiB — one cache block
   var ROOT_CAPTURE_SIZE = 0x4D8000;
@@ -39,17 +41,12 @@ export function createFspIdentityConfig() {
       0x01, 0x00
   ];
 
-  // CivSwitchFS original SLEEP offsets in nanoseconds; the canary loop may
-  // retune them from measured role spans, within a bounded drift.
-  // 2026-11-14: tried the full Slapah/Kurumuz reference schedule for boots 7-8:
-  // flip rate collapsed (70% windows, no flip in 12 attempts, retune stalled a
-  // canary check for 79s and cleanup failed). Reverted to the hybrid schedule,
-  // which lands flips on attempts 1-2.
-  var roleDelays = [0, 300000, 350000, 450000, 550000, 650000,
-                    1000000, 1200000, 1300000, 1700000];
-  // Guard delays after groupReleased, in nanoseconds.
-  // Slapah/Kurumuz reference: [0, 150000].
+  // My own working delays, seems to be best for the current implementation without RPC
+  var roleDelays = [0, 300000, 350000, 450000, 550000, 650000, 1000000, 1200000, 1300000, 1700000];
   var guardDelays = [150000, 300000];
+  // References from Slapah / Kurumuz
+  //var roleDelays = [0, 300000, 350000, 450000, 550000, 650000, 1700000, 2000000, 2150000, 2800000];
+  //var guardDelays = [0, 150000];
   var roleLabels = ["commit", "bottleneck", "frag0", "frag1", "frag2", "frag3",
       "canary", "filler0", "filler1", "release", "guard0", "guard1", "trigger"];
   var roleShort = ["C", "B", "F0", "F1", "F2", "F3", "Y", "X0", "X1", "R",
@@ -79,6 +76,7 @@ export function createFspIdentityConfig() {
     MARKER_OFFSET,
     WINDOW_MINIMUM_CACHE_HELD,
     FIELD_MINIMUM_CACHE_HELD,
+    MONITORING_ROUNDS,
     CACHE_READ_SIZE,
     CONTROL_SIZE,
     ROOT_CAPTURE_SIZE,

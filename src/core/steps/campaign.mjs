@@ -1,4 +1,8 @@
-import coreRuntime from "../runtime.mjs";
+import coreRuntime, {waitMs} from "../runtime.mjs";
+import {
+    emitFastStage,
+    isVerboseLogging
+} from "../log-stage.mjs";
 
 const {
   GADGET_MEMSET,
@@ -19,7 +23,7 @@ const {
   writeDirtyData
 } = coreRuntime;
 
-export const WINDOW_RATE_THRESHOLD = 0.5;
+export const WINDOW_RATE_THRESHOLD = 0.8;
 const TIMING_NOISE_FLOOR_US = 75;
 const TIMING_MAX_STEP_US = 250;
 const TIMING_MAX_DRIFT_US = 1000;
@@ -54,6 +58,7 @@ export async function runControlWaveLoop({
   segments,
   selectedDir,
   triggerBuf,
+  renamePathBuffers = null,
   clearPkt,
   clearSendIndex,
   pinSendIndex,
@@ -64,7 +69,8 @@ export async function runControlWaveLoop({
   setupPath,
   setupPkt,
   timingBaseline = null,
-  allowTimingAdjustments = true
+  allowTimingAdjustments = true,
+  shouldStop = null
 }) {
   let canaryQualified;
   let dirtyWriteBuf;
@@ -96,6 +102,7 @@ export async function runControlWaveLoop({
     var waveTimingRecords = [];
     var verboseWaveLines = [];
     var timingAdjustments = [];
+    var stoppedByUser = false;
   var pinQualificationDiagnostics = null;
     wavesStarted = 0;
     wavesJoined = 0;
@@ -107,7 +114,15 @@ export async function runControlWaveLoop({
         guardDelays: config.guardDelays.slice()
     };
 
+    // Give queued controller input a chance to run before starting the first
+    // wave, then yield after each wave so a stop press prevents the next one.
+    await waitMs(0);
     for (var attempt = 0; attempt < config.MAX_CONTROL_WAVES; attempt++) {
+        if (shouldStop?.()) {
+            stoppedByUser = true;
+            workflowStopReason = "stopped-by-user";
+            break;
+        }
         if (canaryQualified) break;
         var profile = nextProfile;
 
@@ -130,6 +145,9 @@ export async function runControlWaveLoop({
             workflowStopReason = "profile-setup-failed-" + profile;
             break;
         }
+
+        var renameInputBefore = renamePathBuffers && isVerboseLogging()
+            ? helpers.captureRenameInputState(REQ, renamePathBuffers) : null;
 
         var group = openReservationGroup(rootSession, pktBuf, 59);
         if (!group.ok) {
@@ -183,7 +201,8 @@ export async function runControlWaveLoop({
                 preSendIndex: preSendIndex, rootSession, sendIndices,
                 abortControlCanonical: abortControlCanonical,
                 canaryPath: canaryPath, savedHandle, setupPath: setupPath,
-                setupPkt: setupPkt
+                setupPkt: setupPkt, renamePathBuffers,
+                renameInputBefore
             });
         pinHandle = wResult.pinHandle;
         pinFirstWaveQualified = wResult.pinFirstWaveQualified;
@@ -277,15 +296,20 @@ export async function runControlWaveLoop({
             nextProfile = "positive";
         }
 
-        verboseWaveLines.push(helpers.formatWaveSummaryLine(
-            attempt + 1, profile, wResult,
-            wResult.window ? "QUALIFIED" : "REJECTED", {config}));
+        if (isVerboseLogging())
+            verboseWaveLines.push(helpers.formatWaveSummaryLine(
+                attempt + 1, profile, wResult, null, {config}));
 
+        await waitMs(0);
+        if (shouldStop?.()) {
+            stoppedByUser = true;
+            workflowStopReason = "stopped-by-user";
+            break;
+        }
     }
 
-    // The runtime log policy suppresses these lines unless verbose logging is
-    // enabled. Emit after the wave loop so diagnostics do not delay a wave.
-    for (const line of verboseWaveLines) await log(line);
+    // Emit wave output after the loop so logging cannot perturb wave timing.
+    for (const line of verboseWaveLines) await emitFastStage(line);
 
     const positiveAttempts = profileCounts.positive || 0;
     let timingRecords = null;
@@ -308,13 +332,15 @@ export async function runControlWaveLoop({
         }
     }
 
-    if (allowTimingAdjustments && !canaryQualified && timingRecords) {
+    if (allowTimingAdjustments && !stoppedByUser &&
+        !canaryQualified && timingRecords) {
         const changes = applyTimingAdjustments(timingRecords, config, baseline,
             timingSource === "control");
         for (const change of changes) {
             timingAdjustments.push({
                 afterWave: wavesJoined,
-                reason: timingSource + "-window-rate-below-50-percent",
+                reason: timingSource + "-window-rate-below-" +
+                    Math.round(WINDOW_RATE_THRESHOLD * 100) + "-percent",
                 source: timingSource,
                 ...change
             });
@@ -328,6 +354,8 @@ export async function runControlWaveLoop({
         campaignState = "worker-unsafe";
     } else if (positiveHealthFailures > 0) {
         campaignState = "post-health-failure";
+    } else if (stoppedByUser) {
+        campaignState = "user-stopped";
     } else if (canaryQualified) {
         campaignState = "flip-qualified";
     } else if (controlsQualified && positiveWindows > 0) {
@@ -343,6 +371,7 @@ export async function runControlWaveLoop({
     return {ok: true, canaryQualified, dirtyWriteBuf, dirtyWritePkt,
       pinFirstWaveQualified, pinHandle, wavesJoined, wavesStarted,
       workerStateSafe, campaignState, controlsQualified, nextProfile,
+      stoppedByUser,
       workflowStopReason,
       profileCounts,
       abortControlPassed, abortHoleControlPassed, extentQualified,

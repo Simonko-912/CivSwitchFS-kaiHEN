@@ -5,3 +5,9 @@ npm-debug.log*
 
 # Generated compression output
 *.hex
+
+# Logs
+logs/
+
+# Tests
+test-payloads/

