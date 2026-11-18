@@ -1,5 +1,11 @@
 # CivSwitchFS-kaiHEN
 
+> [!NOTE]
+> Fork of [s8n/CivSwitchFS-kaiHEN](https://github.com/s8n/CivSwitchFS-kaiHEN) (branch `slop`, itself a fork of [ItsNerisma/CivSwitchFS](https://github.com/ItsNerisma/CivSwitchFS)) adapted for LDN delivery. Changes vs upstream (delivery only, payload code in `src/` untouched):
+> - `npm run build` writes the single-file payload to `payload.js` at the repository root (instead of `dist/core.js`); a prebuilt copy is committed. Default entry is `src/chain.mjs` so one payload carries promotion + kaiHEN chain.
+> - README documents the LDN flow: put `payload.js` in `switch/payload.js` on the SD card of a Switch 1 running [civswitch-ldn-nx](https://github.com/Simonko-912/civswitch-ldn-nx), join the lobby, press ZL — the payload goes over local wireless, no PC or Wi-Fi needed.
+> - `npm run send` / `npm run persist:*` kept as direct-IP fallback.
+
 > [!IMPORTANT]
 > Thanks to [**Slapah**](https://github.com/byizmysh/IZCIVSwitch/blob/main/NOTICE.md#upstream) for the ns2jb filesystem port to CivSwitch and [**Kurumuz**](https://gitlab.com/kurumuz/ns2jb) for the improved fork of ns2jb from [**pepsipu**](https://gitlab.com/pepsipu/ns2jb), which laid the groundwork for this research. All kudos goes to them for the Civ FS port :heart: This is a fork of CivSwitchFS which is by **Nerisma**, who did the difficult work of getting FS acquisition work locally!
 
@@ -110,6 +116,31 @@ npm run send -- <console-ip>
 
 Wait for **`You just Civ Sevened your machine, congrats`** which obviously means success :tada: !
 Then, the loader automatically shows `Awaiting payload at <ip>:9026` and you are free to send payloads.
+
+### Deliver the chain payload over LDN (recommended)
+
+`npm run build` writes the single-file chain payload (promotion + kaiHEN in
+one eval) to `payload.js` in the repository root. A prebuilt copy is
+committed, so you can skip the build.
+
+1. Copy `payload.js` to `switch/payload.js` on the SD card of the Switch 1
+   running CivSwitch-LDN-NX.
+2. On the Switch 2 SD card, place the kaiHEN files per the table below
+   (`/kaihen/bin/...`, `/hbmenu.nro`, `/switch/ounceshell.nro`).
+3. Start the CivSwitch Remote JS Loader on the Switch 2, launch
+   CivSwitch-LDN-NX on the Switch 1, join the lobby (R), then press **ZL**
+   to deliver `payload.js` over local wireless.
+
+Wait for `CHAIN: promotion retained a session — starting kaiHEN` and then
+`HEN IS RUNNING`. Close the game normally and hold R while opening a Switch 2
+game twice to reach hbmenu.
+
+A computer on the same network can still push payloads directly:
+
+~~~sh
+npm run send -- <console-ip>
+~~~
+
 
 ### Timing calibration
 
